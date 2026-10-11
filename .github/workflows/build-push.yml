@@ -20,7 +20,7 @@
 #
 #   changes   what changed            (dorny/paths-filter)
 #   build     one matrix entry per changed service
-#             -> reusable/build-image.yml, which owns the whole per-service job
+#             -> build-image.yml, which owns the whole per-service job
 #                (checkout, JDK, QEMU, buildx, OIDC, Maven, image build, the
 #                 two Trivy scans, the push)
 #             -> .github/actions/ecr-login for the login itself, a composite
@@ -202,7 +202,23 @@ jobs:
     # The whole per-service job lives in the reusable workflow. `matrix` is
     # supported on a job that calls one, which is what lets eight of these run
     # in parallel without this file restating any of the build steps.
-    uses: ./.github/workflows/reusable/build-image.yml
+    #
+    # Top level, NOT .github/workflows/reusable/ — PETPLAT-53 asks for that
+    # subdirectory, and GitHub rejects it. "Subdirectories of the workflows
+    # directory are not supported" is the documented rule, and the symptom is a
+    # red X on this line reading "workflows must be defined at the top level of
+    # the .github/workflows/ directory".
+    #
+    # Nothing local catches it, and that was tested rather than assumed.
+    # actionlint 1.7.12 flags a bogus job key and an undefined ${{ }} in this
+    # very file, so it is reading it — but it exits 0 on this line pointed at a
+    # subdirectory, and exits 0 on it pointed at a file that does not exist
+    # either. It does not resolve local `uses:` paths at all. YAML parsing and
+    # `helm template` have nothing to object to. The only check is the push.
+    #
+    # The subdirectory has to stay empty; the reusable marker here is the
+    # `on: workflow_call` in the called file.
+    uses: ./.github/workflows/build-image.yml
 
     with:
       service: ${{ matrix.service }}

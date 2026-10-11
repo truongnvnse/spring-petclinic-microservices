@@ -5,10 +5,15 @@
 # ---------------------------------------------------------------------------
 #
 # PETPLAT-53 asks for the shared steps to be extracted into
-# `.github/workflows/reusable/`, and names `ecr-login.yml` as an example. The
-# per-service build is extracted that way — `reusable/build-image.yml` is a real
-# reusable workflow. This file is not, and the reason is the whole point of the
-# distinction:
+# `.github/workflows/reusable/`, and names `ecr-login.yml` as an example. Two
+# things in that are wrong, and this file is the answer to both.
+#
+# First the directory: GitHub does not support reusable workflows in a
+# subdirectory of `.github/workflows/`, so the per-service build lives at
+# `.github/workflows/build-image.yml` — see the `uses:` line in build-push.yml.
+# The build is still a genuine reusable workflow.
+#
+# Second, and this is the whole point of the distinction, this file is not one:
 #
 #   A reusable WORKFLOW runs as its own job, on its own runner. `docker login`
 #   writes a credential into ~/.docker/config.json on THAT runner. When the job
