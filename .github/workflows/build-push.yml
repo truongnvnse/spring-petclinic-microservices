@@ -1,0 +1,306 @@
+# build-push.yml — the first half of the CI pipeline (PETPLAT-49, PETPLAT-53, PETPLAT-105)
+#
+# Push to main -> work out which services actually changed -> build, scan and
+# push just those as ARM64 images -> tell the platform repo what was built.
+#
+# The platform repo's update-image-tags.yml receives the dispatch and commits
+# the new tag into helm-values/. ArgoCD watches that repository, so the commit
+# is the deployment. Nothing here touches the cluster: no kubectl, no helm, no
+# EKS credentials. That is the CI/CD split CLAUDE.md states as a hard rule.
+#
+# Why repository_dispatch and not workflow_run: workflow_run only fires for
+# workflows in the SAME repository. This file runs in the application repo and
+# the workflow that consumes it lives in the platform repo, so there is no
+# workflow_run relationship to key off. The dispatch event is the only
+# mechanism that crosses that boundary.
+#
+# ---------------------------------------------------------------------------
+# This file is the orchestration only
+# ---------------------------------------------------------------------------
+#
+#   changes   what changed            (dorny/paths-filter)
+#   build     one matrix entry per changed service
+#             -> reusable/build-image.yml, which owns the whole per-service job
+#                (checkout, JDK, QEMU, buildx, OIDC, Maven, image build, the
+#                 two Trivy scans, the push)
+#             -> .github/actions/ecr-login for the login itself, a composite
+#                action rather than a workflow, because a login has to outlive
+#                the step that performs it — see that file's header
+#   dispatch  the repository_dispatch to the platform repo
+#
+# The reusable workflow and the composite action are PETPLAT-53's deliverable:
+# the shared work lives in one place and both halves of the pipeline call into
+# it rather than carrying their own copy.
+
+name: Build and Push Images
+
+on:
+  push:
+    branches: [main]
+
+# Least privilege at the top, raised only where it is needed. `id-token: write`
+# is granted on the build job alone, because that is the only job that requests
+# an OIDC token — handing it to `changes` and `dispatch` as well would widen the
+# blast radius of a compromised third-party action for no benefit.
+permissions:
+  contents: read
+
+# A newer push to main supersedes an older one. Letting both run would race:
+# the older build could finish last and dispatch its own, older SHA over the
+# newer tag. Cancelling means only the newest commit's images are ever pushed
+# and only its tag is ever dispatched.
+#
+# The cost of that, stated rather than implied: if the newer run then fails —
+# one matrix entry red under fail-fast: false, or a Trivy DB download error —
+# nothing dispatches. helm-values/ is unchanged, so the cluster stays on the
+# previous tag. That is safe, but it is now stale, and the commit that would
+# have deployed it has already been cancelled. The only signal is a red run,
+# because no chat or paging integration is wired up yet. Cancelling is still
+# the right trade — an older SHA racing a newer one into the same tag is worse
+# than a cluster that is merely behind — but it is a trade, not a free win.
+#
+# This is the opposite of update-image-tags.yml's concurrency setting, and
+# deliberately so. There the two runs are both real builds whose commits both
+# matter, so they queue. Here the earlier run has been made irrelevant by the
+# later one, so it is cancelled.
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Where the repository_dispatch is sent. The platform repo, not this one.
+  PLATFORM_REPOSITORY: truongnvnse/petclinic-platform
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Which services changed
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      # A JSON array of short service names, e.g. ["vets-service"]. The build
+      # job feeds this straight into fromJson() for its matrix.
+      services: ${{ steps.select.outputs.services }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history, and the depth is the point rather than an oversight.
+          # paths-filter is expected to resolve a push event through the compare
+          # API, where this working tree is not consulted at all — but if it
+          # takes the git path instead, it needs `github.event.before` to exist
+          # as an object in this repository, and the default depth of 1 does not
+          # contain it. At depth 1 a shallow checkout is not a harmless extra
+          # that might help: it is precisely the thing that would make the git
+          # path fail.
+          #
+          # Depth 0 costs a few seconds on a repository this size and makes the
+          # step correct under whichever mode the action picks, rather than
+          # correct under the mode this file assumes it picks.
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+        with:
+          # One filter per service, keyed by the SHORT service name. That name
+          # is the single spelling used in four places — the Maven module suffix
+          # here, the ECR repository suffix, the helm-values filename, and the
+          # ArgoCD Application name — so the matrix below can pass it straight
+          # through without a translation table.
+          #
+          # `changes` is the action's own output: the JSON array of filter keys
+          # that matched, which is exactly the matrix input.
+          filters: |
+            shared:
+              - 'pom.xml'
+              - 'docker/**'
+              - 'mvnw'
+              - 'mvnw.cmd'
+              - '.mvn/**'
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+
+      - name: Decide which services to build
+        id: select
+        env:
+          CHANGED: ${{ steps.filter.outputs.changes }}
+          SHARED: ${{ steps.filter.outputs.shared }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${SHARED}" == "true" ]]; then
+            # The root pom, the Dockerfile and the Maven wrapper are inputs to
+            # every image, so a change to any of them invalidates all eight.
+            #
+            # Without this branch those changes would build NOTHING: no service
+            # directory matched, so `changes` would be [] and the build would be
+            # skipped. The edit would sit in git doing nothing until some
+            # unrelated per-service commit happened to rebuild that one service
+            # — so a Dockerfile fix would reach the eight images one at a time,
+            # in whatever order people happened to touch them, and the last
+            # service might never pick it up at all. Silent, and slow to notice.
+            services='["config-server","discovery-server","api-gateway","customers-service","visits-service","vets-service","genai-service","admin-server"]'
+            echo "A shared build input changed (pom.xml, docker/, or the Maven wrapper) — every image needs rebuilding."
+          else
+            # `shared` is a filter like any other, so it appears in `changes`
+            # when it matches. It is not a service and must not reach the
+            # matrix, which would look for a module called spring-petclinic-shared.
+            services=$(jq -c '[.[] | select(. != "shared")]' <<< "${CHANGED}")
+          fi
+
+          echo "services=${services}" >> "${GITHUB_OUTPUT}"
+          echo "Services to build: ${services}"
+
+  # ---------------------------------------------------------------------------
+  # Build, scan and push — one matrix entry per changed service
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.service }}
+    needs: changes
+
+    # An empty matrix is a hard error in GitHub Actions ("Matrix must define at
+    # least one vector"), not a no-op, so a push that touched nothing buildable
+    # has to skip this job rather than hand it an empty array. A commit that
+    # only edits a README lands here, and skipping is the correct outcome: there
+    # is nothing to rebuild and no tag to dispatch.
+    if: needs.changes.outputs.services != '[]'
+
+    permissions:
+      contents: read
+      # Raised here and nowhere else. The reusable workflow exchanges this for
+      # the OIDC token that replaces a long-lived AWS access key.
+      id-token: write
+
+    strategy:
+      # One service failing must not cancel the other seven mid-push: they are
+      # independent images, and a partial push of the ones that succeeded is
+      # strictly better than no push at all. The dispatch job below still holds
+      # back unless every entry succeeded.
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.changes.outputs.services) }}
+
+    # The whole per-service job lives in the reusable workflow. `matrix` is
+    # supported on a job that calls one, which is what lets eight of these run
+    # in parallel without this file restating any of the build steps.
+    uses: ./.github/workflows/reusable/build-image.yml
+
+    with:
+      service: ${{ matrix.service }}
+      sha: ${{ github.sha }}
+
+      # Region and account ID are repository VARIABLES, not secrets, and that
+      # is a correctness choice rather than a style one. GitHub replaces a
+      # secret's value with *** everywhere it appears in a log. Held as a
+      # secret, AWS_ACCOUNT_ID would blank the account out of every registry
+      # URL this job prints — `***.dkr.ecr.eu-central-1.amazonaws.com/...` —
+      # and AWS_REGION would blank the region out of every AWS CLI error, which
+      # is the text someone actually reads when this pipeline breaks.
+      #
+      # It would also defeat the point of ecr-login's account assertion, whose
+      # entire job is to name the two account IDs when they disagree. As
+      # secrets, both would render as *** and the message would name nothing.
+      #
+      # Neither value is confidential; the role ARN stays a secret.
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
+
+      # ecr-namespace is left at its default of petclinic-dev in the reusable
+      # workflow. A prod build would pass petclinic-prod here and would also
+      # need its own role, because this environment's role is scoped to the dev
+      # repository ARNs — see "Promotion: one tag, two registries" in the
+      # platform repo's docs/ci-operations.md.
+
+    # Named individually rather than `secrets: inherit`, so the build job
+    # receives one secret and not PLATFORM_REPO_TOKEN. This job runs eight
+    # times over application code and has no reason to hold a PAT that can write
+    # to the platform repository.
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ---------------------------------------------------------------------------
+  # Tell the platform repo what was built
+  # ---------------------------------------------------------------------------
+  dispatch:
+    name: Notify the platform repo
+    needs: [changes, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # needs: [changes, build] already skips this job when the build was skipped
+    # or failed — a skipped or failed need propagates. That is the intent: a
+    # partial build must not dispatch, because the platform repo would then tag
+    # every service it knows about with a SHA that exists for only some of them.
+
+    steps:
+      - name: Build the dispatch payload
+        env:
+          # The JSON array from the changes job. Passed through env rather than
+          # interpolated into the script: `${{ }}` inside run: is textual
+          # substitution performed before the shell sees the script.
+          CHANGED: ${{ needs.changes.outputs.services }}
+        run: |
+          set -euo pipefail
+
+          sha="${GITHUB_SHA::7}"
+
+          if [[ ! "${sha}" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "::error::Expected a 7-character hex SHA, got ${#sha} characters (value withheld)."
+            exit 1
+          fi
+
+          # JSON array -> space-separated string, which is the form
+          # update-image-tags.yml reads out of the payload and splits on.
+          services=$(jq -r 'join(" ")' <<< "${CHANGED}")
+
+          # Built with jq rather than assembled with printf so the payload is
+          # valid JSON by construction. client-payload is a string field, and a
+          # hand-written one is one unescaped character away from a dispatch
+          # that the receiving workflow rejects — or worse, silently misparses.
+          payload=$(jq -nc --arg sha "${sha}" --arg services "${services}" \
+            '{sha: $sha, services: $services}')
+
+          {
+            echo "SHA=${sha}"
+            echo "SERVICES=${services}"
+            echo "PAYLOAD=${payload}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Dispatching app-image-built for ${sha}: ${services}"
+
+      - name: Fire the repository_dispatch
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        with:
+          # PLATFORM_REPO_TOKEN is a fine-grained PAT with write access to the
+          # platform repository, created by hand — GITHUB_TOKEN cannot cross a
+          # repository boundary, and no GitHub App is installed here. It is the
+          # one long-lived credential in this pipeline, and it is scoped to a
+          # single repository with contents:write and nothing else.
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          repository: ${{ env.PLATFORM_REPOSITORY }}
+          event-type: app-image-built
+          client-payload: ${{ env.PAYLOAD }}
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error::The images were built and pushed, but the dispatch to ${PLATFORM_REPOSITORY} failed. Nothing will deploy: the platform repo's helm-values/ is unchanged and no tag moved. The builds are green, so do NOT re-run them — re-run this job once PLATFORM_REPO_TOKEN and the repository name are right. See docs/ci-operations.md in the platform repo."

@@ -1,0 +1,441 @@
+# build-image.yml — reusable workflow: build, scan and push ONE service (PETPLAT-49, PETPLAT-53, PETPLAT-105)
+#
+# Called once per changed service by build-push.yml, through a matrix. It is a
+# reusable workflow rather than a composite action because the unit of work is a
+# whole JOB: it wants its own runner, its own JDK, its own buildx builder and
+# its own 30-minute budget, and eight of them should run in parallel. A
+# composite action would run all of that serially inside one caller's job.
+#
+# The login, by contrast, IS a composite action — see
+# `.github/actions/ecr-login/action.yml` for why the two are not the same thing.
+#
+# ---------------------------------------------------------------------------
+# Why the build is `docker/build-push-action` and not `mvnw -P buildDocker`
+# ---------------------------------------------------------------------------
+#
+# docs/technical-spec.md → "Build Steps" step 6 gives the Maven route:
+#
+#   ./mvnw clean install -P buildDocker -Dcontainer.platform="linux/arm64"
+#
+# The profile exists, it works, and it does pass `--platform linux/arm64`. It is
+# still not what runs here, for three reasons that are all consequences of the
+# same thing — the profile was written to push to Docker Hub by hand, not to
+# feed a scan gate:
+#
+#   1. It tags the image `${docker.image.prefix}/${project.artifactId}` with no
+#      tag at all, which Docker resolves to `:latest`. The pipeline rule is that
+#      production images carry the 7-character commit SHA and never `latest`,
+#      so every image would have to be re-tagged immediately afterwards. Here
+#      the tag is set once, at build time, to the reference that gets scanned
+#      and pushed.
+#
+#   2. It takes EXPOSED_PORT from `docker.image.exposed.port`, and those values
+#      are wrong in four of the eight modules — measured, not assumed:
+#
+#        spring-petclinic-api-gateway       8081   (listens on 8080)
+#        spring-petclinic-vets-service      8081   (listens on 8083)
+#        spring-petclinic-genai-service     8081   (listens on 8084)
+#        spring-petclinic-visits-service    unset  (listens on 8082)
+#
+#      For the first three that is a wrong `EXPOSE` line and nothing more, since
+#      EXPOSE is metadata. For visits-service the property is not defined at
+#      all, so the build argument arrives as the literal text
+#      `${docker.image.exposed.port}` and the Dockerfile's `EXPOSE` is handed a
+#      port that is not a port. The table in this file is the fix, and it is the
+#      one place the eight ports are written down for CI.
+#
+#   3. The scan has to sit between the build and the push, on an image that is
+#      present in the local Docker daemon under a name we chose. Driving the
+#      build here makes that explicit: build with `load: true` and `push: false`,
+#      scan, and only then push. With the profile, the image lands wherever the
+#      builder put it and the gate has to go looking for it.
+#
+# The profile is not dead — it is still the right thing for a developer building
+# an image locally. `./mvnw install -P buildDocker -Dcontainer.platform=linux/arm64`
+# behaves exactly as its author intended on a workstation. It is only the CI
+# path that needs a tag, a port table and a gate.
+
+name: Build and push one service image
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: >-
+          Short service name, e.g. customers-service. Must match the Maven
+          module suffix (spring-petclinic-{service}), the ECR repository suffix
+          and the helm-values filename — all three use this one spelling.
+        required: true
+        type: string
+
+      sha:
+        description: >-
+          Commit SHA to build. The image tag is its first 7 characters, which
+          is the form update-image-tags.yml validates and writes into
+          helm-values/.
+        required: true
+        type: string
+
+      ecr-namespace:
+        description: >-
+          ECR repository namespace, i.e. the path segment after the registry
+          host. Defaults to petclinic-dev; a prod build would pass
+          petclinic-prod and would also need its own role, because this
+          environment's role is scoped to the dev repository ARNs.
+        required: false
+        type: string
+        default: petclinic-dev
+
+      # Inputs rather than secrets, because GitHub masks a secret's value as
+      # *** everywhere it appears in a log. The account ID sits inside every
+      # registry URL this job echoes, and the region sits inside every AWS CLI
+      # error message — so holding either one as a secret would censor exactly
+      # the output someone needs when this job fails. Neither value is
+      # confidential.
+      aws-region:
+        description: AWS region holding the ECR repositories, e.g. eu-central-1.
+        required: true
+        type: string
+
+      aws-account-id:
+        description: >-
+          The AWS account the role is expected to live in. Passed through to
+          ecr-login, which compares it against sts:GetCallerIdentity before the
+          login is used for anything.
+        required: true
+        type: string
+
+    # Declared explicitly rather than inherited with `secrets: inherit`. The
+    # build needs one secret and PLATFORM_REPO_TOKEN is not it — this job never
+    # dispatches anything, so there is no reason for a PAT that can write to the
+    # platform repository to be reachable from inside a job that runs eight
+    # times in parallel over application code.
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+# contents: read for the checkout; id-token: write for the OIDC token that
+# replaces the access key. The calling job must grant both — a reusable workflow
+# can only reduce its caller's permissions, never raise them.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # Named `build` per .claude/rules/pipelines.md → "Job Naming". The rule also
+  # lists separate `scan` and `push` jobs; those are steps here, deliberately.
+  # Splitting them would put each on its own runner, and the image this job
+  # loaded into its local daemon does not exist on any other runner — the scan
+  # job would find nothing to scan and the push job nothing to push.
+  build:
+    name: ${{ inputs.service }}
+    runs-on: ubuntu-latest
+
+    # A hung ARM64 build would otherwise sit here for GitHub's 6-hour ceiling.
+    # ~10 minutes is the expected path: Maven ~3, emulated image build ~5, two
+    # Trivy scans ~2.
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the application repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The image is tagged with `inputs.sha`, so the working tree has to BE
+          # that commit. Without this line the checkout lands on the event's
+          # HEAD while the tag is whatever was passed in — identical today,
+          # because the only caller passes github.sha, but the two come apart
+          # the first time anything builds an older SHA: a rollback re-run (see
+          # docs/rollback-runbook.md) or the prod-promotion job described in
+          # docs/ci-operations.md. The result would be an image tagged with the
+          # old commit's SHA that contains the new commit's code, so rolling
+          # back to that tag would deploy the very change being rolled back.
+          #
+          # Pinning the ref makes that case either correct or loud: if a
+          # non-tip SHA could not be fetched, this step fails right here instead
+          # of quietly building something else and labelling it as the request.
+          ref: ${{ inputs.sha }}
+
+          # One commit is all this job reads. The tag comes from `inputs.sha`
+          # rather than from git, and this job writes nothing back to the
+          # repository — the tag reaches the platform repo through the
+          # repository_dispatch in build-push.yml.
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          java-version: '17'
+          # temurin, matching the `eclipse-temurin:17` base image in
+          # docker/Dockerfile. maven-build.yml asks for `adopt`, which is the
+          # retired AdoptOpenJDK name; compiling on one JDK and running on
+          # another is a class of bug that costs more to diagnose than the
+          # cache key is worth.
+          distribution: temurin
+          cache: maven
+
+      # QEMU has to be registered before buildx creates its builder, otherwise
+      # the builder starts without the binfmt handlers and every ARM64 RUN step
+      # fails with "exec format error" — an error that names the binary rather
+      # than the missing emulator.
+      - name: Set up QEMU (ARM64 emulation)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        # The default `docker` driver cannot cross-build. This action creates a
+        # `docker-container` builder and makes it the default, which is what
+        # makes `platforms: linux/arm64` below work on an x86_64 runner.
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: ./.github/actions/ecr-login
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          # Inputs, not secrets — see the workflow_call block above. Held as
+          # secrets, these two are what turn the account assertion's message
+          # into "account ***, but AWS_ACCOUNT_ID is ***".
+          region: ${{ inputs.aws-region }}
+          account-id: ${{ inputs.aws-account-id }}
+
+      - name: Build the service jar
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+
+          # -pl with -am, not a bare `install`: the reactor builds this module
+          # and whatever it depends on, and stops. Without -pl the matrix would
+          # run a full eight-module build eight times over.
+          #
+          # -DskipTests because this job's output is an image, not a verdict.
+          # maven-build.yml already runs the full test suite on the same push,
+          # and running it again here would multiply the matrix by the suite
+          # while reporting the same result.
+          ./mvnw -B -pl "spring-petclinic-${SERVICE}" -am package -DskipTests
+
+      - name: Resolve the image reference and the Docker build arguments
+        env:
+          SERVICE: ${{ inputs.service }}
+          SHA: ${{ inputs.sha }}
+          ECR_NAMESPACE: ${{ inputs.ecr-namespace }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::sha must be 7-40 lowercase hex characters (got ${#SHA} characters; value withheld)"
+            exit 1
+          fi
+
+          short_sha="${SHA::7}"
+
+          # The Dockerfile is COPYing ${ARTIFACT_NAME}.jar, so this has to be
+          # the jar's basename without the extension. No module sets
+          # <finalName>, so Maven's default applies: {artifactId}-{version} —
+          # which is where the version lives. Globbing the target directory
+          # reads it from the artifact instead of hardcoding 4.0.1 here, so a
+          # pom version bump does not need a matching edit in this file.
+          # A read loop rather than `mapfile`: mapfile is a bash 4 builtin and
+          # the default bash on macOS is still 3.2, so a `mapfile` version of
+          # this step cannot be run on a developer's machine to check it. The
+          # runner has bash 5 and would not care either way — the point is that
+          # the script stays executable everywhere it might be read.
+          jars=()
+          while IFS= read -r jar_path; do
+            jars+=("${jar_path}")
+          done < <(
+            find "spring-petclinic-${SERVICE}/target" -maxdepth 1 -type f -name '*.jar' \
+              ! -name '*-sources.jar' ! -name '*-javadoc.jar'
+          )
+
+          if [[ ${#jars[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one jar in spring-petclinic-${SERVICE}/target, found ${#jars[@]}."
+            if [[ ${#jars[@]} -gt 0 ]]; then
+              printf '  found: %s\n' "${jars[@]}"
+            fi
+            echo "::error::The spring-boot-maven-plugin's repackage goal leaves the pre-repackage jar as *.jar.original, which does not match *.jar — so a count of 0 means the module did not build, and a count above 1 means something else is producing jars here."
+            exit 1
+          fi
+
+          artifact="${jars[0]##*/}"
+          artifact="${artifact%.jar}"
+
+          # The eight listening ports, from the application configuration rather
+          # than from the modules' `docker.image.exposed.port` properties. See
+          # the header: four of those eight values are wrong, and one is absent.
+          case "${SERVICE}" in
+            config-server)      port=8888 ;;
+            discovery-server)   port=8761 ;;
+            api-gateway)        port=8080 ;;
+            customers-service)  port=8081 ;;
+            visits-service)     port=8082 ;;
+            vets-service)       port=8083 ;;
+            genai-service)      port=8084 ;;
+            admin-server)       port=9090 ;;
+            *)
+              echo "::error::No port is known for service '${SERVICE}'. Add it to this table and to the paths-filter in build-push.yml."
+              exit 1
+              ;;
+          esac
+
+          image_ref="${REGISTRY}/${ECR_NAMESPACE}/${SERVICE}:${short_sha}"
+
+          {
+            echo "SHORT_SHA=${short_sha}"
+            echo "ARTIFACT_NAME=${artifact}"
+            echo "EXPOSED_PORT=${port}"
+            echo "IMAGE_REF=${image_ref}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Building ${image_ref}"
+          echo "  artifact:    ${artifact}.jar"
+          echo "  exposed port: ${port}"
+
+      - name: Build the ARM64 image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          # The module's target/ directory, matching what the Maven profile
+          # passes as the build context. The Dockerfile is taken from docker/,
+          # outside the context, which is why it is named separately.
+          context: spring-petclinic-${{ inputs.service }}/target
+          file: docker/Dockerfile
+
+          # The whole reason QEMU and buildx are set up above. t4g nodes are
+          # Graviton, and an amd64 image on an ARM64 node fails to start with
+          # "exec format error" — the same message a missing emulator gives,
+          # which is worth knowing when reading a pod that will not come up.
+          platforms: linux/arm64
+
+          build-args: |
+            ARTIFACT_NAME=${{ env.ARTIFACT_NAME }}
+            EXPOSED_PORT=${{ env.EXPOSED_PORT }}
+
+          # One tag, and it is the reference that gets scanned and then pushed.
+          # Nothing is re-tagged between the build and the push, so the thing
+          # Trivy approved is byte-for-byte the thing ECR receives.
+          tags: ${{ env.IMAGE_REF }}
+
+          # Load into the local daemon and do NOT push. This is what makes the
+          # scan gate possible: aquasecurity/trivy-action is a composite action,
+          # so it runs on this runner and can see this daemon. A push-then-scan
+          # order would put an unscanned image in ECR, and a registry does not
+          # un-pull.
+          load: true
+          push: false
+
+          # Both off, and not by preference. `load: true` uses the docker
+          # exporter, which cannot carry attestation manifests — buildx either
+          # drops them with a warning or refuses the load depending on version.
+          # Turning them off makes the build deterministic rather than
+          # version-dependent. Restoring provenance means pushing straight from
+          # buildx, which means giving up the pre-push scan, which is the wrong
+          # trade for this pipeline.
+          provenance: false
+          sbom: false
+
+      # Two scans of the same image, on purpose, because PETPLAT-105 asks for
+      # two different outcomes from one report:
+      #
+      #   report  CRITICAL and HIGH, never fails — the artifact a human reads
+      #   gate    CRITICAL only, fails the build — what actually blocks a push
+      #
+      # Running them as one scan with a parsed report would save about a minute
+      # and cost the property that matters: the gate's verdict would depend on
+      # this pipeline's ability to parse Trivy's output, so a format change
+      # would silently turn the gate off. Two invocations cannot fail open.
+      - name: Scan image — report (CRITICAL and HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: table
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          ignore-unfixed: false
+          output: trivy-${{ inputs.service }}-report.txt
+
+      - name: Scan image — gate (CRITICAL blocks the push)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: table
+          severity: 'CRITICAL'
+          exit-code: '1'
+          # Every CRITICAL fails the build, including ones with no upstream fix.
+          # `ignore-unfixed: true` is the common setting and it is the wrong one
+          # here: it would make the gate's strength depend on whether a vendor
+          # has shipped a patch, so a vulnerability could pass simply by being
+          # neglected long enough. Unfixable findings are accepted one at a time
+          # in .trivyignore, in a commit, with a reason.
+          ignore-unfixed: false
+          trivyignores: .trivyignore
+          # Written to a file as well as failing the step, so the artifact
+          # records exactly what the gate objected to and not just that it did.
+          output: trivy-${{ inputs.service }}-gate.txt
+
+      - name: Show the gate report in the log
+        if: failure()
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          # The gate writes to a file, which keeps the table out of the log on
+          # success. On failure that is backwards — the log is where anyone
+          # looks first. `if: failure()` also fires when an earlier step failed,
+          # in which case there is no report to show, hence the existence check
+          # rather than a bare cat.
+          file="trivy-${SERVICE}-gate.txt"
+          if [[ -f "${file}" ]]; then
+            echo "=== ${file} ==="
+            cat "${file}"
+          else
+            echo "No gate report was produced — the failure happened before the scan."
+          fi
+
+      - name: Upload the scan reports
+        # always(), not success(): the runs where the gate fails are exactly the
+        # runs whose report someone needs to read, and the default condition
+        # would skip the upload on all of them.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-${{ inputs.service }}
+          path: trivy-${{ inputs.service }}-*.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Push the scanned image to ECR
+        run: |
+          set -euo pipefail
+
+          # Reached only if the gate above passed — a failed step ends the job,
+          # so this line is the gate's enforcement, not a comment about it.
+          #
+          # There is no `aws ecr describe-images` verification afterwards on
+          # purpose. The role in terraform/modules/github-oidc/ is granted the
+          # push half of the ECR API and not the read half, so that a
+          # compromised build cannot pull earlier artifacts back out. A verify
+          # step here would need that permission restored, which would be
+          # weakening the role to make the pipeline feel safer.
+          docker push "${IMAGE_REF}"
+
+      - name: Log out of ECR
+        # always(), because the run most worth clearing the credential after is
+        # the one that did not finish cleanly. The runner is ephemeral and the
+        # token expires by itself in ~12 hours, so what is at stake is the rest
+        # of this job and nothing beyond it — cheap hygiene rather than a
+        # load-bearing control. It is here because a missing logout is a
+        # standing finding in the platform repo's pipeline review checklist, and
+        # a step that costs nothing is better than a finding that recurs.
+        if: always()
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Deliberately not `set -e`: failing to log out must not turn a green
+          # build red, and there is nothing to do about it if it does fail.
+          docker logout "${REGISTRY}" || true
+
+      - name: Report failure
+        if: failure()
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          echo "::error::Build of ${SERVICE} failed. No image was pushed for this service, and build-push.yml will not fire the dispatch, so helm-values/ is unchanged and nothing was deployed — the cluster is still on the previous tag. See docs/ci-operations.md in the platform repo."

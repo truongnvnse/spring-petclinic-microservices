@@ -1,0 +1,70 @@
+# .trivyignore — documented exceptions to the Trivy gate (PETPLAT-105)
+#
+# The build-push workflow fails on any CRITICAL vulnerability it finds. This
+# file is the escape hatch, and it is deliberately the ONLY one: there is no
+# `continue-on-error` on the scan step, so the single way to let a CRITICAL
+# through is to name it here, in a commit, with a reason.
+#
+# That is the whole design. A gate with a second, quieter bypass is not a gate,
+# and an exception that lives only in someone's memory is not an exception —
+# it is a vulnerability nobody has agreed to accept yet.
+#
+# ---------------------------------------------------------------------------
+# Format
+# ---------------------------------------------------------------------------
+#
+# One entry per line. Trivy matches by vulnerability ID, and the ID may be
+# followed by an optional free-text comment after `#`:
+#
+#   CVE-2024-12345        # shipped in a base image layer we do not control
+#
+# Trivy also accepts a `pkg:...` or `path:...` qualifier on the same line to
+# narrow an exception to one package or one file, which is worth using whenever
+# the ID is not itself the whole story:
+#
+#   CVE-2024-12345   pkg:jar/org.example/thing@1.2.3
+#
+# ---------------------------------------------------------------------------
+# What every entry MUST carry in this repository
+# ---------------------------------------------------------------------------
+#
+# An entry is a decision to ship a known-vulnerable artifact, so the commit
+# that adds one has to record the four things a reviewer needs:
+#
+#   1. Why it cannot be fixed right now — no upstream patch, or the patch is
+#      blocked behind a major version we are not taking yet. "It was noisy" is
+#      not a reason.
+#   2. What it actually exposes here. A CRITICAL in a code path this service
+#      never executes is a different risk from one on the request path, and
+#      the difference is the whole justification.
+#   3. Who accepted it, by ROLE rather than by name, and on what date. The
+#      exception needs an owner for the day it is questioned.
+#   4. When it gets looked at again. An exception with no review date becomes
+#      permanent by default, which is how allowlists rot.
+#
+# Put that in the commit message and reference the ticket. Example:
+#
+#   CVE-2024-12345   # no upstream fix; unreachable in this service (see below)
+#   #   exposure:  the vulnerable class is only loaded by the batch profile,
+#   #              which no petclinic service activates
+#   #   owner:     platform engineer, 2026-10-11
+#   #   revisit:   2026-12-11, or when spring-boot 3.x.y lands
+#   #   ticket:    PETPLAT-105
+#
+# ---------------------------------------------------------------------------
+# Expiry is not enforced by Trivy here
+# ---------------------------------------------------------------------------
+#
+# Trivy will honour an entry forever. The revisit date above is a promise, not
+# a control, and nothing in this pipeline fails when it passes. If the list
+# grows past a handful of entries, move it to `.trivyignore.yaml`, which
+# supports an `expired_at` field that Trivy does enforce, and the date stops
+# depending on anyone remembering it.
+#
+# ---------------------------------------------------------------------------
+# Current exceptions
+# ---------------------------------------------------------------------------
+#
+# None. Every CRITICAL reported by the gate is currently expected to fail the
+# build. This is the state to defend: the first entry here should be a decision
+# someone made deliberately, not the first time a red build was inconvenient.

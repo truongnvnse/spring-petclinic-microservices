@@ -1,0 +1,127 @@
+# ecr-login — composite action (PETPLAT-53)
+#
+# ---------------------------------------------------------------------------
+# Why this is an ACTION and not a reusable WORKFLOW
+# ---------------------------------------------------------------------------
+#
+# PETPLAT-53 asks for the shared steps to be extracted into
+# `.github/workflows/reusable/`, and names `ecr-login.yml` as an example. The
+# per-service build is extracted that way — `reusable/build-image.yml` is a real
+# reusable workflow. This file is not, and the reason is the whole point of the
+# distinction:
+#
+#   A reusable WORKFLOW runs as its own job, on its own runner. `docker login`
+#   writes a credential into ~/.docker/config.json on THAT runner. When the job
+#   ends the runner is destroyed, and a reusable workflow has no channel to hand
+#   the credential back to its caller. Extracted as a workflow, this step would
+#   log in, succeed, and leave the caller still anonymous — the failure would
+#   appear later as a 401 from `docker push`, in a different job, with nothing
+#   pointing at the cause.
+#
+#   A composite ACTION runs its steps inside the CALLER's job, on the caller's
+#   runner. The login lands in the caller's docker config and the following
+#   steps in that same job can push. That is the primitive for "do these steps,
+#   then let me keep using the result", so that is what this is.
+#
+# The rule of thumb: a reusable workflow shares a JOB, a composite action shares
+# STEPS. Anything whose effect has to outlive itself — a login, a checkout, an
+# installed tool — has to be an action.
+#
+# ---------------------------------------------------------------------------
+# Why it also asserts the account
+# ---------------------------------------------------------------------------
+#
+# Logging in is two steps and would be fine inline. The assertion is what earns
+# this file its existence: assuming a role that lives in a DIFFERENT AWS account
+# than the one the cluster pulls from does not fail. The credentials are valid,
+# the login succeeds, the push succeeds, and the images land in a registry
+# nobody is watching. The first symptom is ImagePullBackOff on every pod, in a
+# cluster whose config never mentioned the account that was actually written to.
+#
+# `aws sts get-caller-identity` costs nothing and turns that into a red build
+# naming the two account IDs.
+#
+# Which is exactly why `account-id` and `region` arrive as workflow INPUTS and
+# not as secrets. GitHub replaces a secret's value with *** everywhere it
+# appears in a log, so held as secrets both account IDs would print as *** and
+# this message would name nothing — the build would still fail, but the reason
+# would be unreadable. The region matters for the same reason: it appears in
+# every AWS CLI error message, and `eu-central-1` blanked out of those leaves a
+# worse log than no log at all.
+
+name: Log in to Amazon ECR
+description: >-
+  Assume the CI role via OIDC, log Docker in to ECR, and assert the role lives
+  in the account the cluster pulls from.
+
+inputs:
+  role-arn:
+    description: ARN of the role to assume via GitHub's OIDC token.
+    required: true
+
+  region:
+    description: AWS region holding the ECR repositories.
+    required: true
+
+  account-id:
+    description: >-
+      The AWS account the role is expected to live in. Checked against
+      sts:GetCallerIdentity before the login is used for anything.
+    # Required, because the assertion below is this action's entire reason to
+    # exist and an unset input should be a hard error at the call site rather
+    # than a mismatch message about an empty string. It fails closed either way
+    # — nothing equals a real account ID — but the failure is worth naming
+    # correctly.
+    required: true
+
+outputs:
+  registry:
+    description: >-
+      ECR registry hostname, e.g.
+      550798137608.dkr.ecr.eu-central-1.amazonaws.com. Taken from the login
+      itself rather than assembled from the account ID, so it cannot drift from
+      the credentials actually in use.
+    value: ${{ steps.login.outputs.registry }}
+
+runs:
+  using: composite
+
+  steps:
+    - name: Configure AWS credentials via OIDC
+      uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.region }}
+        role-session-name: gha-ecr-${{ github.run_id }}
+
+        # aws-access-key-id and aws-secret-access-key are deliberately absent,
+        # and must stay absent. Supplying either one silently switches this
+        # action from OIDC to a static key — it does not error, it just stops
+        # federating. The whole pipeline is built so that there is no
+        # long-lived credential to leak, and this is the line where that would
+        # be undone.
+
+    - name: Assert the role is in the expected account
+      shell: bash
+      env:
+        EXPECTED_ACCOUNT: ${{ inputs.account-id }}
+      run: |
+        set -euo pipefail
+
+        actual=$(aws sts get-caller-identity --query Account --output text)
+
+        if [[ "${actual}" != "${EXPECTED_ACCOUNT}" ]]; then
+          echo "::error::Assumed a role in account ${actual}, but AWS_ACCOUNT_ID is ${EXPECTED_ACCOUNT}. This would NOT have failed on its own: the role is valid and the push would succeed — into the wrong registry, which no cluster reads. Fix AWS_ROLE_ARN on this repository."
+          exit 1
+        fi
+
+        echo "Authenticated to account ${actual}."
+
+    - name: Log in to Amazon ECR
+      id: login
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      # The action runs `aws ecr get-login-password` and pipes the result into
+      # `docker login --password-stdin`. The password is never an argument and
+      # never reaches the log, which is why the spec's hand-written
+      # `aws ecr get-login-password --region eu-central-1` does not appear here
+      # as a literal command.
