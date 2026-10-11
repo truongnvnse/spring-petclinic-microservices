@@ -38,6 +38,16 @@
              BOM reads ${tomcat.version}, so this property wins. Delete this once
              the parent manages 11.0.25 or later, rather than pinning behind it. -->
         <tomcat.version>11.0.26</tomcat.version>
+
+        <!-- The same lag, in the one service the tomcat override does not
+             reach. spring-cloud-starter-netflix-eureka-server pulls in
+             spring-boot-starter-freemarker for the Eureka dashboard, and Boot's
+             BOM pins freemarker 2.3.34 in every released version — 4.1.1
+             included — while the gate needs 2.3.35 for CVE-2026-84939.
+             discovery-server is the only module that depends on eureka-server,
+             so it is the only image this affects. Same rule as above: delete it
+             once the parent manages 2.3.35. -->
+        <freemarker.version>2.3.35</freemarker.version>
         <chaos-monkey-spring-boot.version>4.0.0</chaos-monkey-spring-boot.version>
         <jolokia-core.version>1.7.1</jolokia-core.version>
         <datasource-micrometer.version>2.0.1</datasource-micrometer.version>
